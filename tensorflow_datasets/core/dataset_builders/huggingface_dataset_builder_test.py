@@ -244,13 +244,20 @@ def get_load_dataset_builder_mock():
     hf_builder = load_dataset_builder_mock.return_value
     hf_builder.info.citation = "citation"
     hf_builder.info.description = "description"
-    hf_builder.info.features = None
+    hf_builder.info.features = {}
     hf_builder.info.splits = ["all"]
     hf_builder.info.supervised_keys = None
     hf_builder.info.version = "1.0.0"
 
+    features = {"feature": hf_datasets.Value("int32")}
+
+    def download_and_prepare(*unused_args, **unused_kwargs):
+      hf_builder.info.features = features
+
+    hf_builder.download_and_prepare.side_effect = download_and_prepare
+
     dataset = mock.MagicMock()
-    dataset.info.features = {"feature": hf_datasets.Value("int32")}
+    dataset.info.features = features
     dataset_dict = hf_datasets.DatasetDict({"test": dataset})
     hf_builder.as_dataset.return_value = dataset_dict
     yield load_dataset_builder_mock
@@ -282,7 +289,7 @@ def get_huggingface_dataset_builder_mock(load_dataset_builder_mock):
 def test_all_parameters_are_passed_down_to_hf(
     load_dataset_builder_mock, builder
 ):
-  builder._split_generators(None)
+  builder._generate_splits(None, None)
   load_dataset_builder_mock.return_value.download_and_prepare.assert_called_once_with(
       verification_mode="all_checks", num_proc=100
   )
@@ -324,4 +331,4 @@ def test_default_value():
 
 @skip_because_huggingface_cannot_be_imported
 def test_hf_features(builder):
-  assert builder._hf_features() == {"feature": hf_datasets.Value("int32")}
+  assert builder._hf_info.features == {"feature": hf_datasets.Value("int32")}

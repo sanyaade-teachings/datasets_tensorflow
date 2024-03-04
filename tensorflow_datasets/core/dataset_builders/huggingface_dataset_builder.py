@@ -26,13 +26,15 @@ Huggingface.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+import dataclasses
 import datetime
 import functools
 import io
 import itertools
 import multiprocessing
 import os
-from typing import Any, Dict, Mapping, Optional, Tuple, Type, Union
+from typing import Any, Dict, Mapping, Optional, Type, Union
 
 from absl import logging
 from etils import epath
@@ -40,6 +42,7 @@ import numpy as np
 from tensorflow_datasets.core import dataset_builder
 from tensorflow_datasets.core import dataset_info as dataset_info_lib
 from tensorflow_datasets.core import download
+from tensorflow_datasets.core import example_serializer
 from tensorflow_datasets.core import features as feature_lib
 from tensorflow_datasets.core import file_adapters
 from tensorflow_datasets.core import lazy_imports_lib
@@ -48,7 +51,7 @@ from tensorflow_datasets.core import split_builder as split_builder_lib
 from tensorflow_datasets.core import splits as splits_lib
 from tensorflow_datasets.core import utils
 from tensorflow_datasets.core.utils import dtype_utils
-from tensorflow_datasets.core.utils import py_utils
+from tensorflow_datasets.core.utils import shard_utils
 from tensorflow_datasets.core.utils.lazy_imports_utils import tensorflow as tf
 
 _IMAGE_ENCODING_FORMAT = "png"
@@ -230,17 +233,15 @@ def _convert_value(hf_value: Any, feature: feature_lib.FeatureConnector) -> Any:
   )
 
 
-def _convert_example(
-    index: int,
-    example: Mapping[str, Any],
+def _convert_hf_example(
+    hf_example: Mapping[str, Any],
     features: feature_lib.FeaturesDict,
-) -> Tuple[int, Mapping[str, Any]]:
+) -> Mapping[str, Any]:
   """Converts an example from Huggingface format to TFDS format."""
-  converted_example = {
+  return {
       name: _convert_value(value, features[name])
-      for name, value in example.items()
+      for name, value in hf_example.items()
   }
-  return index, converted_example
 
 
 def _extract_supervised_keys(hf_info):
@@ -315,6 +316,84 @@ def _remove_empty_splits(
   return non_empty_splits
 
 
+@dataclasses.dataclass(frozen=True)
+class _ShardSpec:
+  """Spec to write a shard.
+
+  Attributes:
+    path: Shard path.
+    split: HuggingFace split name.
+    start_index: Index of the shard start.
+    end_index: Index of the shard end.
+    num_bytes: Shard size in bytes.
+    num_examples: Number of examples in the shard.
+    shard_split: HuggingFace split for the shard.
+  """
+
+  path: epath.Path
+  split: str
+  start_index: int
+  end_index: int
+  num_bytes: int = dataclasses.field(init=False)
+
+  @property
+  def num_examples(self) -> int:
+    return self.end_index - self.start_index
+
+  @property
+  def shard_split(self) -> str:
+    return f"{self.split}[{self.start_index}:{self.end_index}]"
+
+  def set_num_bytes(self, num_bytes: int):
+    super().__setattr__("num_bytes", num_bytes)
+
+
+def _write_shard(
+    shard_spec: _ShardSpec,
+    hf_builder,
+    example_writer,
+    features: feature_lib.FeaturesDict,
+) -> int:
+  """Writes a shard to a file and computes its size in bytes.
+
+  Args:
+    shard_spec: Shard spec.
+    hf_builder: HuggingFace dataset builder.
+    example_writer: Example writer.
+    features: TFDS features dict.
+
+  Returns:
+    Shard size in bytes.
+  """
+  serialized_info = features.get_serialized_info()
+  serializer = example_serializer.ExampleSerializer(serialized_info)
+  num_bytes = 0
+
+  def get_serialized_examples_iter():
+    nonlocal num_bytes
+    for hf_example in hf_builder.as_dataset(
+        split=shard_spec.shard_split, run_post_process=False
+    ):
+      example = _convert_hf_example(hf_example, features)
+      serialized_example = serializer.serialize_example(example)
+      num_bytes += len(serialized_example)
+      yield serialized_example
+
+  example_writer.write(
+      os.fspath(shard_spec.path),
+      utils.tqdm(
+          enumerate(get_serialized_examples_iter()),
+          desc=f"Writing {shard_spec.path} examples...",
+          unit=" examples",
+          total=shard_spec.num_examples,
+          leave=False,
+          mininterval=1.0,
+      ),
+  )
+
+  return num_bytes
+
+
 class HuggingfaceDatasetBuilder(
     dataset_builder.GeneratorBasedBuilder, skip_registration=True
 ):
@@ -357,14 +436,14 @@ class HuggingfaceDatasetBuilder(
           f" hf_repo_id={self._hf_repo_id}, hf_config={self._hf_config},"
           f" config_kwargs={self.config_kwargs}"
       ) from e
-    self._hf_info = self._hf_builder.info
-    version = str(self._hf_info.version or self._hf_builder.VERSION or "1.0.0")
+    hf_info = self._hf_builder.info
+    version = str(hf_info.version or self._hf_builder.VERSION or "1.0.0")
     self.VERSION = utils.Version(version)  # pylint: disable=invalid-name
     if self._hf_config:
       self._converted_builder_config = dataset_builder.BuilderConfig(
           name=tfds_config,
           version=self.VERSION,
-          description=self._hf_info.description,
+          description=hf_info.description,
       )
     else:
       self._converted_builder_config = None
@@ -392,31 +471,20 @@ class HuggingfaceDatasetBuilder(
   ) -> Optional[dataset_builder.BuilderConfig]:
     return self._converted_builder_config
 
-  @functools.lru_cache(maxsize=1)
-  def _download_and_prepare_for_hf(self) -> Mapping[str, Any]:
+  @functools.cached_property
+  def _hf_info(self):
     login_to_hf(self._hf_hub_token)
     self._hf_builder.download_and_prepare(
         num_proc=self._hf_num_proc,
         verification_mode=self._verification_mode,
     )
-    return self._hf_builder.as_dataset(
-        verification_mode=self._verification_mode,
-    )
+    return self._hf_builder.info
 
-  def _hf_features(self):
-    if self._hf_info.features is not None:
-      return self._hf_info.features
-    # We need to download and prepare the data to know its features.
-    dataset_dict = self._download_and_prepare_for_hf()
-    for dataset in dataset_dict.values():
-      return dataset.info.features
-
-  @py_utils.memoize()
   def _info(self) -> dataset_info_lib.DatasetInfo:
     return dataset_info_lib.DatasetInfo(
         builder=self,
         description=self._hf_info.description,
-        features=extract_features(self._hf_features()),
+        features=extract_features(self._hf_info.features),
         citation=self._hf_info.citation,
         license=self._hf_info.license,
         supervised_keys=_extract_supervised_keys(self._hf_info),
@@ -426,25 +494,109 @@ class HuggingfaceDatasetBuilder(
   def _split_generators(
       self, dl_manager: download.DownloadManager
   ) -> Dict[splits_lib.Split, split_builder_lib.SplitGenerator]:
-    del dl_manager
-    ds = self._download_and_prepare_for_hf()
-    splits = {
-        split: self._generate_examples(data) for split, data in ds.items()
-    }
-    return _remove_empty_splits(splits)
+    raise NotImplementedError()
 
   def _generate_examples(self, data) -> split_builder_lib.SplitGenerator:
-    dataset_info = self._info()
+    raise NotImplementedError()
+
+  def _generate_splits(
+      self,
+      dl_manager: download.DownloadManager,
+      download_config: download.DownloadConfig,
+  ) -> Sequence[splits_lib.SplitInfo]:
+    """Prepares the dataset by writing to shards directly."""
+    del dl_manager, download_config
+    shard_specs_by_split = {}
+
+    for split, split_info in self._hf_info.splits.items():
+      shard_specs_by_split[split] = self._compute_shard_specs(split_info)
+
+    self._write_shards(
+        list(itertools.chain.from_iterable(shard_specs_by_split.values()))
+    )
+
+    return [
+        splits_lib.SplitInfo(
+            name=split,
+            shard_lengths=[
+                shard_spec.num_examples
+                for shard_spec in shard_specs_by_split[split]
+            ],
+            num_bytes=sum(
+                shard_spec.num_bytes
+                for shard_spec in shard_specs_by_split[split]
+            ),
+            filename_template=self._get_filename_template(split),
+        )
+        for split in self._hf_info.splits
+    ]
+
+  def _compute_shard_specs(self, split_info) -> Sequence[_ShardSpec]:
+    """Returns specs for evenly spread shards.
+
+    Args:
+      split_info: HuggingFace split info.
+    """
+    # HF split size is good enough for estimating the number of shards.
+    num_shards = shard_utils.ShardConfig.calculate_number_shards(
+        total_size=split_info.num_bytes,
+        num_examples=split_info.num_examples,
+        uses_precise_sharding=False,
+    )
+    filename_template = self._get_filename_template(split_info.name)
+    shard_boundaries = shard_utils.get_shard_boundaries(
+        num_examples=split_info.num_examples, number_of_shards=num_shards
+    )
+
+    prev_shard_boundary = 0
+    shard_specs = []
+
+    for shard_index, shard_boundary in enumerate(shard_boundaries):
+      shard_specs.append(
+          _ShardSpec(
+              path=filename_template.sharded_filepath(
+                  shard_index=shard_index, num_shards=len(shard_boundaries)
+              ),
+              split=split_info.name,
+              start_index=prev_shard_boundary,
+              end_index=shard_boundary,
+          )
+      )
+      prev_shard_boundary = shard_boundary
+
+    return shard_specs
+
+  def _write_shards(
+      self,
+      shard_specs: list[_ShardSpec],
+  ):
+    """Writes shards to files and computes their sizes in bytes.
+
+    Args:
+      shard_specs: Shard specs.
+    """
+    shard_specs = utils.tqdm(
+        shard_specs,
+        desc="Writing shards...",
+        unit=" shards",
+        total=len(shard_specs),
+        leave=False,
+    )
+    write_shard = functools.partial(
+        _write_shard,
+        hf_builder=self._hf_builder,
+        example_writer=self._example_writer(),
+        features=self.info().features,
+    )
+
     if self._tfds_num_proc is None:
-      for index, example in enumerate(data):
-        yield _convert_example(index, example, dataset_info.features)
+      all_num_bytes = map(write_shard, shard_specs)
     else:
       with multiprocessing.Pool(processes=self._tfds_num_proc) as pool:
-        examples = pool.starmap(
-            functools.partial(_convert_example, features=dataset_info.features),
-            enumerate(data),
-        )
-        yield from examples
+        all_num_bytes = pool.map(write_shard, shard_specs)
+
+    for shard_spec, num_bytes in zip(shard_specs, all_num_bytes):
+      shard_spec.set_num_bytes(num_bytes)
 
 
 def builder(
