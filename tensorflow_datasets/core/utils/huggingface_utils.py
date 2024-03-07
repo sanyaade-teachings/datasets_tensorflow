@@ -16,11 +16,14 @@
 """Utility functions for huggingface_dataset_builder."""
 
 from collections.abc import Mapping, Sequence
+import datetime
 from typing import Any, Type
 
+from etils import epath
 import immutabledict
 import numpy as np
 from tensorflow_datasets.core import features as feature_lib
+from tensorflow_datasets.core import lazy_imports_lib
 from tensorflow_datasets.core.utils import dtype_utils
 from tensorflow_datasets.core.utils.lazy_imports_utils import tensorflow as tf
 
@@ -104,6 +107,73 @@ def _get_default_value(
         return False
       else:
         raise ValueError(f'Could not get default value for {feature}')
+
+
+def _convert_hf_value(
+    hf_value: Any, feature: feature_lib.FeatureConnector
+) -> Any:
+  """Converts Huggingface value to a TFDS compatible value.
+
+  Args:
+    hf_value: Huggingface value.
+    feature: The TFDS feature for which we want the compatible value.
+
+  Returns:
+    The TFDS compatible value.
+
+  Raises:
+    ValueError: If couldn't convert the given value.
+  """
+  match hf_value:
+    case None:
+      return _get_default_value(feature)
+    case datetime.datetime():
+      return int(hf_value.timestamp())
+
+  match feature:
+    case feature_lib.ClassLabel() | feature_lib.Scalar():
+      return hf_value
+    case feature_lib.FeaturesDict():
+      return {
+          key: _convert_hf_value(hf_value[key], subfeature)
+          for key, subfeature in feature.items()
+      }
+    case feature_lib.Sequence():
+      match hf_value:
+        case dict():
+          # Should be a dict of lists:
+          return {
+              key: [
+                  _convert_hf_value(sub_hf_value, subfeature)
+                  for sub_hf_value in hf_value[key]
+              ]
+              for key, subfeature in feature.feature.items()
+          }
+        case list():
+          return [
+              _convert_hf_value(sub_hf_value, feature.feature)
+              for sub_hf_value in hf_value
+          ]
+        case _:
+          return [hf_value]
+    case feature_lib.Audio():
+      if array := hf_value.get('array'):
+        # Hugging Face uses floats, TFDS uses integers.
+        return [int(sample * feature.sample_rate) for sample in array]
+      elif (path := hf_value.get('path')) and (
+          path := epath.Path(path)
+      ).exists():
+        return path
+    case feature_lib.Image():
+      hf_value: lazy_imports_lib.lazy_imports.PIL_Image.Image
+      # Ensure RGB format for PNG encoding.
+      return hf_value.convert('RGB')
+    case feature_lib.Tensor():
+      return hf_value
+
+  raise ValueError(
+      f'Conversion of value {hf_value} to feature {feature} is not supported.'
+  )
 
 
 def convert_hf_dataset_name(hf_dataset_name: str) -> str:
