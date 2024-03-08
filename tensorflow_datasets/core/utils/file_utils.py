@@ -153,9 +153,12 @@ def _find_files_without_glob(
   for glob in globs:
     glob_parts = glob.split('/')
     if len(glob_parts) == 1:
-      for file in folder.glob(glob):
-        if file.name in file_names:
-          yield file
+      try:
+        for file in folder.glob(glob):
+          if file.name in file_names:
+            yield file
+      except OSError:
+        return
     else:
       if glob_parts[0] != '*':
         raise NotImplementedError()
