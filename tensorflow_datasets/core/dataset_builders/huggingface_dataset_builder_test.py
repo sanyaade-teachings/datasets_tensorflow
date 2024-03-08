@@ -13,14 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import datetime
 from unittest import mock
 
 from absl import logging
-import numpy as np
 import pytest
-import tensorflow as tf
-from tensorflow_datasets.core import features as feature_lib
 from tensorflow_datasets.core import lazy_imports_lib
 from tensorflow_datasets.core import registered
 from tensorflow_datasets.core.dataset_builders import huggingface_dataset_builder
@@ -64,84 +60,6 @@ def test_from_tfds_to_hf():
     assert huggingface_dataset_builder._from_tfds_to_hf("z")
 
 
-def test_convert_value_datetime():
-  feature = feature_lib.Scalar(dtype=np.int64)
-  epoch_start = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-  assert huggingface_dataset_builder._convert_value(epoch_start, feature) == 0
-  assert (
-      huggingface_dataset_builder._convert_value(
-          datetime.datetime(1970, 1, 2, tzinfo=datetime.timezone.utc), feature
-      )
-      == 86400
-  )
-
-
-def test_convert_value_scalar():
-  int64_feature = feature_lib.Scalar(dtype=np.int64)
-  assert huggingface_dataset_builder._convert_value(42, int64_feature) == 42
-
-  int32_feature = feature_lib.Scalar(dtype=np.int32)
-  assert huggingface_dataset_builder._convert_value(42, int32_feature) == 42
-
-  string_feature = feature_lib.Scalar(dtype=np.object_)
-  assert (
-      huggingface_dataset_builder._convert_value("abc", string_feature) == "abc"
-  )
-
-  bool_feature = feature_lib.Scalar(dtype=np.bool_)
-  assert huggingface_dataset_builder._convert_value(True, bool_feature)
-  assert not huggingface_dataset_builder._convert_value(False, bool_feature)
-
-  float_feature = feature_lib.Scalar(dtype=np.float32)
-  assert huggingface_dataset_builder._convert_value(42.0, float_feature) == 42.0
-
-
-def test_convert_value_sequence():
-  sequence_feature = feature_lib.Sequence(feature=tf.int64)
-  assert huggingface_dataset_builder._convert_value([42], sequence_feature) == [
-      42
-  ]
-  assert huggingface_dataset_builder._convert_value(42, sequence_feature) == [
-      42
-  ]
-  assert (
-      huggingface_dataset_builder._convert_value(None, sequence_feature) == []  # pylint: disable=g-explicit-bool-comparison
-  )
-
-
-def test_convert_value_empty_sequence():
-  assert huggingface_dataset_builder._convert_value(
-      [None, "string"], feature_lib.Sequence(feature=np.str_)
-  ) == [b"", "string"]
-
-
-def test_convert_value_sequence_of_dict():
-  sequence_feature = feature_lib.Sequence(
-      {"someint": feature_lib.Scalar(dtype=np.str_)}
-  )
-  assert huggingface_dataset_builder._convert_value(
-      {"someint": [None, "string", None]}, sequence_feature
-  ) == {"someint": [b"", "string", b""]}
-
-
-def test_convert_value_image():
-  image_feature = feature_lib.Image()
-  image = lazy_imports_lib.lazy_imports.PIL_Image.new(mode="RGB", size=(4, 4))
-  assert huggingface_dataset_builder._convert_value(image, image_feature)
-
-
-def test_convert_value_dict():
-  translation_feature = feature_lib.Translation(languages=["en", "fr", "de"])
-  translation = {
-      "de": b"Hallo Welt",
-      "en": b"Hello world",
-      "fr": None,  # Hugging Face supports `None` values
-  }
-  assert huggingface_dataset_builder._convert_value(
-      translation, translation_feature
-  ) == {"de": b"Hallo Welt", "en": b"Hello world", "fr": b""}
-
-
 def test_remove_empty_splits():
   splits = {"non_empty_split": range(5), "empty_split": range(0)}
   with mock.patch.object(logging, "log"):
@@ -153,45 +71,6 @@ def test_remove_empty_splits():
     )
   assert non_empty_splits.keys() == {"non_empty_split"}
   assert list(non_empty_splits["non_empty_split"]) == list(range(5))
-
-
-# Encapsulate test parameters into a fixture to avoid `datasets` import during
-# tests collection.
-# https://docs.pytest.org/en/7.2.x/example/parametrize.html#deferring-the-setup-of-parametrized-resources
-@pytest.fixture(params=["feat_dict", "audio"], name="features")
-def get_features(request):
-  if request.param == "feat_dict":
-    return (
-        hf_datasets.Features({
-            "id": hf_datasets.Value("string"),
-            "meta": {
-                "left_context": hf_datasets.Value("string"),
-                "partial_evidence": [{
-                    "start_id": hf_datasets.Value("int32"),
-                    "meta": {"evidence_span": [hf_datasets.Value("string")]},
-                }],
-            },
-        }),
-        feature_lib.FeaturesDict({
-            "id": feature_lib.Scalar(dtype=np.str_),
-            "meta": feature_lib.FeaturesDict({
-                "left_context": feature_lib.Scalar(dtype=np.str_),
-                "partial_evidence": feature_lib.Sequence({
-                    "meta": feature_lib.FeaturesDict({
-                        "evidence_span": feature_lib.Sequence(
-                            feature_lib.Scalar(dtype=np.str_)
-                        ),
-                    }),
-                    "start_id": feature_lib.Scalar(dtype=np.int32),
-                }),
-            }),
-        }),
-    )
-  elif request.param == "audio":
-    return (
-        hf_datasets.Audio(sampling_rate=48000),
-        feature_lib.Audio(sample_rate=48000),
-    )
 
 
 @pytest.fixture(name="load_dataset_builder_mock")
@@ -247,14 +126,6 @@ def test_all_parameters_are_passed_down_to_hf(
   load_dataset_builder_mock.return_value.as_dataset.assert_called_once_with(
       verification_mode="all_checks"
   )
-
-
-@skip_because_huggingface_cannot_be_imported
-def test_extract_features(features):
-  hf_features, tfds_features = features
-  assert repr(
-      huggingface_dataset_builder.extract_features(hf_features)
-  ) == repr(tfds_features)
 
 
 @skip_because_huggingface_cannot_be_imported

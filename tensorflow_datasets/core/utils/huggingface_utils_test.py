@@ -13,16 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
+
+import datasets
 import numpy as np
 import pytest
 from tensorflow_datasets.core import features as feature_lib
+from tensorflow_datasets.core import lazy_imports_lib
 from tensorflow_datasets.core.utils import huggingface_utils
 from tensorflow_datasets.core.utils.lazy_imports_utils import tensorflow as tf
 
 
 def test_convert_to_np_dtype_raises():
-  with pytest.raises(ValueError, match='Unrecognized type.+'):
-    huggingface_utils.convert_to_np_dtype('I am no dtype')
+  with pytest.raises(TypeError, match='Unrecognized type.+'):
+    huggingface_utils._convert_to_np_dtype('I am no dtype')
 
 
 @pytest.mark.parametrize(
@@ -46,7 +50,62 @@ def test_convert_to_np_dtype_raises():
     ],
 )
 def test_convert_to_np_dtype(hf_dtype, np_dtype):
-  assert huggingface_utils.convert_to_np_dtype(hf_dtype) is np_dtype
+  assert huggingface_utils._convert_to_np_dtype(hf_dtype) is np_dtype
+
+
+def test_convert_hf_features_raises_type_error():
+  with pytest.raises(TypeError, match='Type <.+> is not supported.'):
+    huggingface_utils.convert_hf_features('I am no features')
+
+
+def test_convert_hf_features_raises_value_error():
+  with pytest.raises(
+      ValueError, match='List \[.+\] should have a length of 1.'
+  ):
+    huggingface_utils.convert_hf_features(
+        [datasets.Value('int32'), datasets.Value('int32')]
+    )
+
+
+@pytest.mark.parametrize(
+    'hf_features,tfds_features',
+    [
+        (
+            datasets.Features(
+                id=datasets.Value('string'),
+                meta={
+                    'left_context': datasets.Value('string'),
+                    'partial_evidence': [{
+                        'start_id': datasets.Value('int32'),
+                        'meta': {'evidence_span': [datasets.Value('string')]},
+                    }],
+                },
+            ),
+            feature_lib.FeaturesDict({
+                'id': feature_lib.Scalar(dtype=np.str_),
+                'meta': feature_lib.FeaturesDict({
+                    'left_context': feature_lib.Scalar(dtype=np.str_),
+                    'partial_evidence': feature_lib.Sequence({
+                        'meta': feature_lib.FeaturesDict({
+                            'evidence_span': feature_lib.Sequence(
+                                feature_lib.Scalar(dtype=np.str_)
+                            ),
+                        }),
+                        'start_id': feature_lib.Scalar(dtype=np.int32),
+                    }),
+                }),
+            }),
+        ),
+        (
+            datasets.Audio(sampling_rate=48000),
+            feature_lib.Audio(sample_rate=48000),
+        ),
+    ],
+)
+def test_convert_hf_features(hf_features, tfds_features):
+  assert repr(huggingface_utils.convert_hf_features(hf_features)) == repr(
+      tfds_features
+  )
 
 
 @pytest.mark.parametrize(
@@ -65,6 +124,88 @@ def test_convert_to_np_dtype(hf_dtype, np_dtype):
 )
 def test_get_default_value(feature, default_value):
   assert huggingface_utils._get_default_value(feature) == default_value
+
+
+@pytest.mark.parametrize(
+    'hf_value,feature',
+    [
+        ({'array': None}, feature_lib.Audio()),
+        ({'path': None}, feature_lib.Audio()),
+    ],
+)
+def test_convert_value_raises(hf_value, feature):
+  with pytest.raises(
+      TypeError, match='Conversion of value.+ is not supported.'
+  ):
+    huggingface_utils.convert_hf_value(hf_value, feature)
+
+
+@pytest.mark.parametrize(
+    'hf_value,feature,expected_value',
+    [
+        # datetime
+        (
+            datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+            feature_lib.Scalar(dtype=np.int64),
+            0,
+        ),
+        (
+            datetime.datetime(1970, 1, 2, tzinfo=datetime.timezone.utc),
+            feature_lib.Scalar(dtype=np.int64),
+            86400,
+        ),
+        # scalar
+        (42, feature_lib.Scalar(dtype=np.int64), 42),
+        (42, feature_lib.Scalar(dtype=np.int32), 42),
+        ('abc', feature_lib.Scalar(dtype=np.object_), 'abc'),
+        (True, feature_lib.Scalar(dtype=np.bool_), True),
+        (False, feature_lib.Scalar(dtype=np.bool_), False),
+        (42.0, feature_lib.Scalar(dtype=np.float32), 42.0),
+        # sequence
+        ([42], feature_lib.Sequence(feature=tf.int64), [42]),
+        (42, feature_lib.Sequence(feature=tf.int64), [42]),
+        (None, feature_lib.Sequence(feature=tf.int64), []),
+        ([None, 'abc'], feature_lib.Sequence(feature=np.str_), [b'', 'abc']),
+        (
+            {'someint': [None, 'string', None]},
+            feature_lib.Sequence(
+                {'someint': feature_lib.Scalar(dtype=np.str_)}
+            ),
+            {'someint': [b'', 'string', b'']},
+        ),
+        # image
+        (
+            lazy_imports_lib.lazy_imports.PIL_Image.new(mode='L', size=(4, 4)),
+            feature_lib.Image(),
+            lazy_imports_lib.lazy_imports.PIL_Image.new(
+                mode='RGB', size=(4, 4)
+            ),
+        ),
+        # dict
+        (
+            {
+                'de': b'Hallo Welt',
+                'en': b'Hello world',
+                'fr': None,  # Hugging Face supports `None` values
+            },
+            feature_lib.Translation(languages=['en', 'fr', 'de']),
+            {
+                'de': b'Hallo Welt',
+                'en': b'Hello world',
+                'fr': b'',
+            },
+        ),
+        (
+            {},
+            feature_lib.FeaturesDict(
+                {'foo': feature_lib.Scalar(dtype=np.str_)}
+            ),
+            {'foo': b''},
+        ),
+    ],
+)
+def test_convert_value(hf_value, feature, expected_value):
+  assert huggingface_utils.convert_hf_value(hf_value, feature) == expected_value
 
 
 @pytest.mark.parametrize(
