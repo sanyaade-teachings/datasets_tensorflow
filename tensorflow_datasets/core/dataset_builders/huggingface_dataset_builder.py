@@ -26,13 +26,11 @@ Huggingface.
 
 from __future__ import annotations
 
-import datetime
 import functools
-import io
 import itertools
 import multiprocessing
 import os
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 from absl import logging
 from etils import epath
@@ -119,83 +117,6 @@ def _from_tfds_to_hf(tfds_name: str) -> str:
   raise registered.DatasetNotFoundError(
       f'"{tfds_name}" is not listed in Hugging Face datasets.'
   )
-
-
-def _convert_value(hf_value: Any, feature: feature_lib.FeatureConnector) -> Any:
-  """Converts a Huggingface value to a TFDS compatible value."""
-  # See the docstring of huggingface_utils._get_default_value for explanations.
-  if hf_value is None:
-    return huggingface_utils._get_default_value(feature)  # pylint: disable=protected-access
-  if isinstance(hf_value, datetime.datetime):
-    return int(hf_value.timestamp())
-  elif isinstance(feature, feature_lib.ClassLabel):
-    return hf_value
-  elif isinstance(feature, feature_lib.Scalar):
-    return hf_value
-  elif isinstance(feature, feature_lib.Translation):
-    if isinstance(hf_value, dict):
-      # Replaces `None` values with the default value.
-      return {
-          key: (
-              value
-              if value is not None
-              else huggingface_utils._get_default_value(feature[key])  # pylint: disable=protected-access
-          )
-          for key, value in hf_value.items()
-      }
-  elif isinstance(feature, feature_lib.FeaturesDict):
-    if isinstance(hf_value, dict):
-      return {k: _convert_value(v, feature[k]) for k, v in hf_value.items()}
-    raise ValueError(f"The feature is {feature}, but the value is: {hf_value}")
-  elif isinstance(feature, feature_lib.Sequence):
-    if isinstance(hf_value, dict):
-      # Should be a dict of lists:
-      return {
-          k: [_convert_value(el, feature.feature[k]) for el in v]
-          for k, v in hf_value.items()
-      }
-    if isinstance(hf_value, list):
-      return [_convert_value(v, feature.feature) for v in hf_value]
-    else:
-      return [hf_value]
-  elif isinstance(feature, feature_lib.Audio):
-    assert isinstance(hf_value, dict), f"Audio {hf_value} should be a dict"
-    if "array" in hf_value:
-      sample_rate = feature.sample_rate
-      # Hugging Face uses float, TFDS uses integers.
-      return [int(s * sample_rate) for s in hf_value["array"]]
-    if "path" in hf_value:
-      path = epath.Path(hf_value["path"])
-      if path.exists():
-        return path
-    else:
-      raise ValueError(f"{hf_value} is not a valid audio feature.")
-  elif isinstance(hf_value, lazy_imports_lib.lazy_imports.PIL_Image.Image):
-    buffer = io.BytesIO()
-    if hf_value.mode == "CMYK":
-      # Convert CMYK images to RGB.
-      hf_value = hf_value.convert("RGB")
-    hf_value.save(fp=buffer, format=_IMAGE_ENCODING_FORMAT)
-    return buffer.getvalue()
-  elif isinstance(feature, feature_lib.Tensor):
-    return hf_value
-  raise ValueError(
-      f"Type {type(hf_value)} of value {hf_value} "
-      f"for feature {type(feature)} is not supported."
-  )
-
-
-def _convert_example(
-    index: int,
-    example: Mapping[str, Any],
-    features: feature_lib.FeaturesDict,
-) -> Tuple[int, Mapping[str, Any]]:
-  """Converts an example from Huggingface format to TFDS format."""
-  converted_example = {
-      name: _convert_value(value, features[name])
-      for name, value in example.items()
-  }
-  return index, converted_example
 
 
 def _extract_supervised_keys(hf_info):
@@ -346,17 +267,14 @@ class HuggingfaceDatasetBuilder(
     return _remove_empty_splits(splits)
 
   def _generate_examples(self, data) -> split_builder_lib.SplitGenerator:
-    dataset_info = self._info()
+    convert_example = functools.partial(
+        huggingface_utils.convert_hf_value, feature=self._info().features
+    )
     if self._tfds_num_proc is None:
-      for index, example in enumerate(data):
-        yield _convert_example(index, example, dataset_info.features)
+      yield from enumerate(map(convert_example, data))
     else:
       with multiprocessing.Pool(processes=self._tfds_num_proc) as pool:
-        examples = pool.starmap(
-            functools.partial(_convert_example, features=dataset_info.features),
-            enumerate(data),
-        )
-        yield from examples
+        yield from enumerate(pool.imap(convert_example, data))
 
 
 def builder(
